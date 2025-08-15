@@ -118,73 +118,89 @@ class MultiReceptorScreening:
         for dir_path in [self.docking_dir, self.logs_dir, self.results_dir]:
             dir_path.mkdir(exist_ok=True)
         
-        # Criar subdiretórios para cada receptor
+        # Criar estrutura de diretórios para resultados: results/receptor/ligante/
+        print("\n📁 Criando estrutura de diretórios...")
         for receptor_name in self.receptors:
-            receptor_dir = self.docking_dir / receptor_name
+            receptor_dir = self.results_dir / receptor_name
             receptor_dir.mkdir(exist_ok=True)
-    
-    def prepare_receptor_files(self, receptor_name):
-        """
-        Copia apenas os arquivos essenciais do receptor para o diretório de trabalho.
+            
+            # Criar subdiretório para cada ligante
+            for ligand in self.ligands:
+                ligand_name = ligand.stem
+                ligand_dir = receptor_dir / ligand_name
+                ligand_dir.mkdir(exist_ok=True)
         
-        Args:
-            receptor_name: Nome do receptor
+        print(f"   ✓ Estrutura criada: results/[receptor]/[ligante]/[arquivos]")
+    
+
+    def create_batch_files(self):
+        """
+        Cria arquivos de batch com todas as combinações receptor-ligante.
+        Formato: 3 linhas por combinação (receptor, ligante, output)
         
         Returns:
-            Path: Diretório de trabalho do receptor
+            list: Lista de arquivos batch criados
         """
-        receptor_info = self.receptors[receptor_name]
-        work_dir = self.docking_dir / receptor_name
+        batch_files = []
+        batch_lines = []
+        batch_id = 0
+        combinations_count = 0
         
-        # Copiar apenas arquivo .fld
-        fld_dest = work_dir / receptor_info['fld'].name
-        if not fld_dest.exists():
-            shutil.copy(receptor_info['fld'], fld_dest)
+        print("\n📝 Criando arquivos batch...")
         
-        # Copiar apenas arquivo .pdbqt correspondente
-        if receptor_info['pdbqt'].exists():
-            pdbqt_dest = work_dir / receptor_info['pdbqt'].name
-            if not pdbqt_dest.exists():
-                shutil.copy(receptor_info['pdbqt'], pdbqt_dest)
-        
-        return work_dir
-    
-    def create_batch_file(self, receptor_name, ligand_batch, batch_id):
-        """
-        Cria arquivo de lote para docking.
-        
-        Args:
-            receptor_name: Nome do receptor
-            ligand_batch: Lista de ligantes
-            batch_id: ID do lote
-        
-        Returns:
-            tuple: (batch_file_path, work_dir)
-        """
-        work_dir = self.docking_dir / receptor_name
-        batch_file = work_dir / f"batch_{receptor_name}_{batch_id}.txt"
-        
-        receptor_info = self.receptors[receptor_name]
-        
-        with open(batch_file, 'w') as f:
-            for ligand in ligand_batch:
-                # Usar caminhos absolutos
+        # Criar todas as combinações receptor-ligante
+        for receptor_name in self.receptors:
+            receptor_info = self.receptors[receptor_name]
+            
+            for ligand in self.ligands:
+                ligand_name = ligand.stem
+                
+                # Caminho absoluto dos arquivos
                 fld_path = str(receptor_info['fld'].absolute())
                 ligand_path = str(ligand.absolute())
                 
-                f.write(f"{fld_path}\n")
-                f.write(f"{ligand_path}\n")
+                # Caminho de saída: results/receptor/ligante/receptor_ligante
+                output_base = self.results_dir / receptor_name / ligand_name / f"{receptor_name}_{ligand_name}"
+                output_path = str(output_base.absolute())
+                
+                # Adicionar 3 linhas ao batch (receptor, ligante, output)
+                batch_lines.append(f"{fld_path}\n")
+                batch_lines.append(f"{ligand_path}\n")
+                batch_lines.append(f"{output_path}\n")
+                combinations_count += 1
+                
+                # Se atingiu o tamanho do batch, salvar arquivo
+                if combinations_count >= self.batch_size:
+                    batch_file = self.docking_dir / f"batch_{batch_id}.txt"
+                    with open(batch_file, 'w') as f:
+                        f.writelines(batch_lines)
+                    
+                    batch_files.append(batch_file)
+                    print(f"   ✓ batch_{batch_id}.txt ({combinations_count} combinações)")
+                    
+                    batch_lines = []
+                    combinations_count = 0
+                    batch_id += 1
         
-        return batch_file, work_dir
+        # Salvar último batch se houver linhas restantes
+        if batch_lines:
+            batch_file = self.docking_dir / f"batch_{batch_id}.txt"
+            with open(batch_file, 'w') as f:
+                f.writelines(batch_lines)
+            
+            batch_files.append(batch_file)
+            print(f"   ✓ batch_{batch_id}.txt ({combinations_count} combinações)")
+        
+        print(f"   Total: {len(batch_files)} arquivos batch")
+        return batch_files
     
-    def dock_batch(self, receptor_name, ligand_batch, batch_id, gpu_id):
+    def dock_batch(self, batch_file, batch_id, gpu_id):
         """
-        Executa docking de um lote.
+        Executa docking de um arquivo batch.
         
         Args:
-            receptor_name: Nome do receptor
-            ligand_batch: Lista de ligantes
-            batch_id: ID do lote
+            batch_file: Arquivo batch com as combinações
+            batch_id: ID do batch
             gpu_id: ID da GPU
         
         Returns:
@@ -192,92 +208,152 @@ class MultiReceptorScreening:
         """
         batch_results = []
         
-        # Preparar arquivos do receptor (apenas .fld e .pdbqt)
-        work_dir = self.prepare_receptor_files(receptor_name)
+        # Comando do AutoDock-GPU
+        cmd = [
+            str(self.autodock_gpu),
+            "--filelist", str(batch_file.absolute()),
+            "--nrun", str(self.runs),
+            "--lsmet", "ad",
+            # "--devnum", str(gpu_id),
+            "--gbest", "1",
+            "--nev", "2500000",
+            "--ngen", "42000",
+            "--lsit", "300",
+        ]
         
-        # Criar arquivo de lote
-        batch_file, work_dir = self.create_batch_file(receptor_name, ligand_batch, batch_id)
+        # Log file
+        log_file = self.logs_dir / f"batch_{batch_id}_gpu_{gpu_id}.log"
         
-        # Processar cada ligante individualmente para ter nomes específicos
-        for ligand in ligand_batch:
-            ligand_name = ligand.stem
+        try:
+            # Contar combinações no batch (3 linhas por combinação)
+            with open(batch_file, 'r') as f:
+                lines = f.readlines()
+                num_combinations = len(lines) // 3
             
-            # Nome do resultado: receptor_ligante
-            result_name = f"{receptor_name}_{ligand_name}"
+            print(f"  🚀 Batch {batch_id} na GPU {gpu_id} ({num_combinations} combinações)")
             
-            # Criar arquivo de batch individual
-            single_batch_file = work_dir / f"single_{result_name}.txt"
-            receptor_info = self.receptors[receptor_name]
+            start_time = time.time()
             
-            with open(single_batch_file, 'w') as f:
-                f.write(f"{str(receptor_info['fld'].absolute())}\n")
-                f.write(f"{str(ligand.absolute())}\n")
+            # Executar docking
+            result = subprocess.run(cmd, cwd=self.docking_dir, 
+                                  capture_output=True, text=True, check=False)
             
-            # Comando do AutoDock-GPU
-            cmd = [
-                str(self.autodock_gpu),
-                "--filelist", str(single_batch_file.absolute()),
-                "--nrun", str(self.runs),
-                "--lsmet", "ad",
-                # "--devnum", str(gpu_id),
-                "--gbest", "1",
-                "--nev", "2500000",
-                "--ngen", "42000",
-                "--lsit", "300",
-                "--resnam", result_name,  # Nome específico: receptor_ligante
-            ]
+            # Salvar log
+            with open(log_file, 'w') as log:
+                log.write(f"Batch file: {batch_file}\n")
+                log.write(f"Working directory: {self.docking_dir}\n")
+                log.write(f"Command: {' '.join(cmd)}\n")
+                log.write(f"Return code: {result.returncode}\n")
+                log.write(f"\n=== STDOUT ===\n{result.stdout}\n")
+                log.write(f"\n=== STDERR ===\n{result.stderr}\n")
             
-            # Log file
-            log_file = self.logs_dir / f"{result_name}.log"
-            
-            try:
-                print(f"  🧪 [{receptor_name}] Docking {ligand_name} na GPU {gpu_id}")
+            if result.returncode != 0:
+                print(f"  ❌ Erro no batch {batch_id} (código: {result.returncode})")
+                print(f"     📄 Log: {log_file}")
                 
-                start_time = time.time()
+                # Mostrar erro
+                error_output = result.stderr if result.stderr else result.stdout
+                if error_output:
+                    error_lines = error_output.split('\n')[:5]
+                    for line in error_lines:
+                        if line.strip():
+                            print(f"     ⚠️  {line.strip()[:100]}")
+            else:
+                elapsed = time.time() - start_time
+                print(f"  ✅ Batch {batch_id} concluído em {elapsed:.1f}s")
                 
-                # Executar docking (resultados vão para self.results_dir)
-                result = subprocess.run(cmd, cwd=self.results_dir, 
-                                      capture_output=True, text=True, check=False)
+                # Verificar se os arquivos foram gerados
+                print(f"     🔍 Verificando resultados...")
                 
-                # Salvar log
-                with open(log_file, 'w') as log:
-                    log.write(f"Receptor: {receptor_name}\n")
-                    log.write(f"Ligand: {ligand_name}\n")
-                    log.write(f"Result name: {result_name}\n")
-                    log.write(f"Working directory: {self.results_dir}\n")
-                    log.write(f"Command: {' '.join(cmd)}\n")
-                    log.write(f"Return code: {result.returncode}\n")
-                    log.write(f"\n=== STDOUT ===\n{result.stdout}\n")
-                    log.write(f"\n=== STDERR ===\n{result.stderr}\n")
+                # Processar resultados de cada combinação no batch
+                batch_results = self._parse_batch_results(batch_file, batch_id)
                 
-                if result.returncode != 0:
-                    print(f"     ❌ Erro: {result_name}")
-                    error_output = result.stderr if result.stderr else result.stdout
-                    if error_output:
-                        error_lines = error_output.split('\n')[:2]
-                        for line in error_lines:
-                            if line.strip():
-                                print(f"        {line.strip()[:80]}")
+                if not batch_results:
+                    print(f"     ⚠️  Nenhum resultado válido encontrado no batch {batch_id}")
+                    # Listar alguns arquivos para debug
+                    print(f"     📁 Verificando diretório de resultados...")
+                    for receptor_name in list(self.receptors.keys())[:2]:  # Verificar apenas 2 receptores
+                        receptor_dir = self.results_dir / receptor_name
+                        if receptor_dir.exists():
+                            dlg_files = list(receptor_dir.glob("*/*.dlg"))[:3]
+                            if dlg_files:
+                                print(f"        Encontrados em {receptor_name}: {len(dlg_files)} arquivos DLG")
+            
+        except Exception as e:
+            print(f"  ❌ Erro no batch {batch_id}: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return batch_results
+    
+    def _parse_batch_results(self, batch_file, batch_id):
+        """
+        Extrai resultados de um batch.
+        
+        Args:
+            batch_file: Arquivo batch processado
+            batch_id: ID do batch
+        
+        Returns:
+            list: Resultados extraídos
+        """
+        results = []
+        
+        # Ler combinações do batch (3 linhas por combinação)
+        with open(batch_file, 'r') as f:
+            lines = f.readlines()
+        
+        # Processar cada combinação (grupos de 3 linhas)
+        for i in range(0, len(lines), 3):
+            if i + 2 < len(lines):
+                fld_path = lines[i].strip()
+                ligand_path = lines[i + 1].strip()
+                output_base = lines[i + 2].strip()
+                
+                # Extrair nomes
+                receptor_name = Path(fld_path).stem.replace('.maps', '')
+                ligand_name = Path(ligand_path).stem
+                
+                # Verificar arquivo DLG
+                dlg_file = Path(f"{output_base}.dlg")
+                
+                if dlg_file.exists():
+                    energy = self._extract_energy(dlg_file)
+                    if energy is not None:
+                        # Salvar caminho relativo se possível, senão apenas o nome
+                        try:
+                            dlg_relative = dlg_file.relative_to(self.output_dir)
+                        except ValueError:
+                            # Se não for possível fazer relativo, usar apenas o nome do arquivo
+                            dlg_relative = f"results/{receptor_name}/{ligand_name}/{dlg_file.name}"
+                        
+                        results.append({
+                            'receptor': receptor_name,
+                            'ligand': ligand_name,
+                            'best_energy': energy,
+                            'dlg_file': str(dlg_relative),
+                            'batch_id': batch_id
+                        })
+                    else:
+                        print(f"     ⚠️  Sem energia válida: {dlg_file.name}")
                 else:
-                    elapsed = time.time() - start_time
-                    print(f"     ✅ {result_name} concluído em {elapsed:.1f}s")
-                    
-                    # Processar resultado
-                    dlg_file = self.results_dir / f"{result_name}.dlg"
-                    if dlg_file.exists():
-                        energy = self._extract_energy(dlg_file)
+                    # Tentar caminho alternativo se o arquivo não existir no caminho absoluto
+                    alt_dlg_file = self.results_dir / receptor_name / ligand_name / f"{receptor_name}_{ligand_name}.dlg"
+                    if alt_dlg_file.exists():
+                        energy = self._extract_energy(alt_dlg_file)
                         if energy is not None:
-                            batch_results.append({
+                            results.append({
                                 'receptor': receptor_name,
                                 'ligand': ligand_name,
                                 'best_energy': energy,
-                                'result_file': result_name
+                                'dlg_file': f"results/{receptor_name}/{ligand_name}/{receptor_name}_{ligand_name}.dlg",
+                                'batch_id': batch_id
                             })
-                
-            except Exception as e:
-                print(f"     ❌ Erro em {result_name}: {e}")
+                    else:
+                        print(f"     ⚠️  Arquivo não encontrado: {receptor_name}_{ligand_name}.dlg")
         
-        return batch_results
+        print(f"     📊 {len(results)} resultados extraídos do batch {batch_id}")
+        return results
     
     def _extract_energy(self, dlg_file):
         """
@@ -310,77 +386,6 @@ class MultiReceptorScreening:
         
         return best_energy
     
-    def _parse_results(self, receptor_name, batch_id, ligand_batch, work_dir):
-        """
-        Extrai resultados do arquivo DLG.
-        
-        Args:
-            receptor_name: Nome do receptor
-            batch_id: ID do lote
-            ligand_batch: Lista de ligantes
-            work_dir: Diretório de trabalho
-        
-        Returns:
-            list: Resultados parseados
-        """
-        results = []
-        dlg_file = work_dir / f"{receptor_name}_batch_{batch_id}.dlg"
-        
-        if not dlg_file.exists():
-            # Tentar encontrar qualquer arquivo .dlg
-            dlg_files = list(work_dir.glob("*.dlg"))
-            if dlg_files:
-                dlg_file = dlg_files[-1]  # Pegar o mais recente
-            else:
-                return results
-        
-        current_ligand = None
-        best_energy = float('inf')
-        
-        try:
-            with open(dlg_file, 'r') as f:
-                for line in f:
-                    if "Ligand:" in line:
-                        # Salvar resultado anterior
-                        if current_ligand and best_energy < float('inf'):
-                            ligand_name = Path(current_ligand).stem
-                            results.append({
-                                'receptor': receptor_name,
-                                'ligand': ligand_name,
-                                'best_energy': best_energy,
-                                'batch_id': batch_id
-                            })
-                        
-                        # Novo ligante
-                        current_ligand = line.split()[-1]
-                        best_energy = float('inf')
-                    
-                    elif "Estimated Free Energy of Binding" in line:
-                        try:
-                            # Formato: = -X.XX kcal/mol
-                            parts = line.split('=')
-                            if len(parts) > 1:
-                                energy_str = parts[1].split('kcal')[0].strip()
-                                energy = float(energy_str)
-                                best_energy = min(best_energy, energy)
-                        except (IndexError, ValueError):
-                            pass
-            
-            # Salvar último resultado
-            if current_ligand and best_energy < float('inf'):
-                ligand_name = Path(current_ligand).stem
-                results.append({
-                    'receptor': receptor_name,
-                    'ligand': ligand_name,
-                    'best_energy': best_energy,
-                    'batch_id': batch_id
-                })
-        
-        except Exception as e:
-            print(f"     ⚠️  Erro ao processar {dlg_file}: {e}")
-        
-        return results
-    
     def run_screening(self):
         """Executa o screening de todos ligantes contra todos receptores."""
         print(f"\n{'='*60}")
@@ -390,37 +395,26 @@ class MultiReceptorScreening:
         print(f"💊 Ligantes: {len(self.ligands)}")
         print(f"🖥️  GPUs: {', '.join(self.gpus)}")
         print(f"🔄 Runs por ligante: {self.runs}")
+        print(f"📦 Tamanho do batch: {self.batch_size}")
         
         total_combinations = len(self.receptors) * len(self.ligands)
         print(f"📊 Total de combinações: {total_combinations}")
         
         start_time = time.time()
         
-        # Criar tarefas para cada receptor
-        all_tasks = []
+        # Criar arquivos batch
+        batch_files = self.create_batch_files()
         
-        for receptor_name in self.receptors:
-            print(f"\n🧬 Preparando tarefas para {receptor_name}...")
-            
-            # Dividir ligantes em lotes menores para melhor paralelização
-            ligand_batches = [self.ligands[i:i+self.batch_size] 
-                            for i in range(0, len(self.ligands), self.batch_size)]
-            
-            # Criar tarefas
-            for batch_id, batch in enumerate(ligand_batches):
-                gpu_id = self.gpus[len(all_tasks) % len(self.gpus)]
-                all_tasks.append((receptor_name, batch, batch_id, gpu_id))
-        
-        print(f"\n📋 Total de lotes: {len(all_tasks)}")
-        print(f"📁 Resultados serão salvos em: {self.results_dir}")
+        print(f"\n📁 Resultados serão salvos em: {self.results_dir}/[receptor]/[ligante]/")
         print(f"\n🚀 Iniciando screening...")
         
-        # Executar tarefas em paralelo
+        # Executar batches em paralelo
         with ThreadPoolExecutor(max_workers=len(self.gpus)) as executor:
             futures = []
             
-            for receptor_name, batch, batch_id, gpu_id in all_tasks:
-                future = executor.submit(self.dock_batch, receptor_name, batch, batch_id, gpu_id)
+            for batch_id, batch_file in enumerate(batch_files):
+                gpu_id = self.gpus[batch_id % len(self.gpus)]
+                future = executor.submit(self.dock_batch, batch_file, batch_id, gpu_id)
                 futures.append(future)
             
             # Coletar resultados
@@ -429,7 +423,7 @@ class MultiReceptorScreening:
                 batch_results = future.result()
                 self.results.extend(batch_results)
                 completed += 1
-                print(f"   📊 Progresso: {completed}/{len(all_tasks)} lotes concluídos")
+                print(f"   📊 Progresso: {completed}/{len(batch_files)} batches concluídos")
         
         elapsed = time.time() - start_time
         
@@ -440,7 +434,7 @@ class MultiReceptorScreening:
         self._save_results()
     
     def _save_results(self):
-        """Salva os resultados em diferentes formatos."""
+        """Salva os resultados em formato CSV."""
         if not self.results:
             print("⚠️  Nenhum resultado para salvar")
             return
@@ -451,29 +445,8 @@ class MultiReceptorScreening:
         # Salvar resultado geral
         csv_path = self.output_dir / "all_results.csv"
         df.to_csv(csv_path, index=False)
-        print(f"\n📁 Resultados gerais salvos em: {csv_path}")
-        
-        # Listar arquivos DLG gerados
-        dlg_files = list(self.results_dir.glob("*.dlg"))
-        print(f"📄 Arquivos DLG gerados: {len(dlg_files)} em {self.results_dir}")
-        
-        # Salvar resultados por receptor
-        for receptor_name in self.receptors:
-            receptor_df = df[df['receptor'] == receptor_name].copy()
-            if not receptor_df.empty:
-                receptor_df = receptor_df.sort_values('best_energy')
-                
-                # Salvar CSV
-                receptor_csv = self.output_dir / f"{receptor_name}_results.csv"
-                receptor_df.to_csv(receptor_csv, index=False)
-                
-                # Mostrar top 5
-                print(f"\n🏆 Top 5 para {receptor_name}:")
-                print(f"{'Rank':<6} {'Ligante':<20} {'Energia (kcal/mol)':<15}")
-                print(f"{'-'*45}")
-                
-                for idx, (_, row) in enumerate(receptor_df.head(5).iterrows(), 1):
-                    print(f"{idx:<6} {row['ligand']:<20} {row['best_energy']:<15.2f}")
+        print(f"\n📁 Resultados salvos:")
+        print(f"   ✓ {csv_path}")
         
         # Criar matriz de resultados (receptores x ligantes)
         print(f"\n📊 Criando matriz de resultados...")
@@ -486,19 +459,48 @@ class MultiReceptorScreening:
         
         matrix_csv = self.output_dir / "energy_matrix.csv"
         pivot_table.to_csv(matrix_csv)
-        print(f"   ✓ Matriz salva em: {matrix_csv}")
+        print(f"   ✓ {matrix_csv}")
+        
+        # Contar arquivos DLG gerados
+        dlg_count = 0
+        for receptor_name in self.receptors:
+            receptor_dir = self.results_dir / receptor_name
+            if receptor_dir.exists():
+                for ligand_dir in receptor_dir.iterdir():
+                    if ligand_dir.is_dir():
+                        dlg_files = list(ligand_dir.glob("*.dlg"))
+                        dlg_count += len(dlg_files)
+        
+        print(f"\n📄 Arquivos DLG gerados: {dlg_count}")
+        print(f"📁 Localização: {self.results_dir}/[receptor]/[ligante]/")
+        
+        # Estatísticas por receptor
+        print(f"\n📊 Resumo por Receptor:")
+        print(f"{'Receptor':<15} {'Processados':<12} {'Melhor Energia':<15}")
+        print(f"{'-'*42}")
+        
+        for receptor_name in self.receptors:
+            receptor_df = df[df['receptor'] == receptor_name]
+            if not receptor_df.empty:
+                count = len(receptor_df)
+                best = receptor_df['best_energy'].min()
+                print(f"{receptor_name:<15} {count:<12} {best:<15.2f}")
         
         # Encontrar melhores combinações globais
         df_sorted = df.sort_values('best_energy')
         
-        print(f"\n🌟 TOP 10 MELHORES COMBINAÇÕES GLOBAIS:")
-        print(f"{'='*60}")
-        print(f"{'Rank':<6} {'Receptor':<15} {'Ligante':<20} {'Energia':<12} {'Arquivo':<20}")
-        print(f"{'-'*60}")
+        print(f"\n🌟 TOP 10 MELHORES COMBINAÇÕES:")
+        print(f"{'='*75}")
+        print(f"{'Rank':<6} {'Receptor':<15} {'Ligante':<20} {'Energia (kcal/mol)':<20}")
+        print(f"{'-'*75}")
         
         for idx, (_, row) in enumerate(df_sorted.head(10).iterrows(), 1):
-            result_file = f"{row['result_file']}.dlg"
-            print(f"{idx:<6} {row['receptor']:<15} {row['ligand']:<20} {row['best_energy']:<12.2f} {result_file:<20}")
+            print(f"{idx:<6} {row['receptor']:<15} {row['ligand']:<20} {row['best_energy']:<20.2f}")
+        
+        print(f"\n✅ Análise concluída!")
+        print(f"   • Total de combinações processadas: {len(df)}")
+        print(f"   • Melhor energia global: {df['best_energy'].min():.2f} kcal/mol")
+        print(f"   • Média de energia: {df['best_energy'].mean():.2f} kcal/mol")
 
 
 def main():
