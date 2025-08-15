@@ -1,0 +1,30 @@
+name: meeko-prep
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Python
+  - python=3.9
+  
+  # RDKit para manipulação molecular
+  - rdkit=2023.09.1
+  
+  # OpenBabel para conversão rápida (opcional)
+  - openbabel=3.1.1
+  
+  # NumPy (dependência do Meeko)
+  - numpy>=1.20
+  
+  # Pandas para análise de resultados
+  - pandas>=1.3
+  
+  # Pip para instalar Meeko
+  - pip
+  
+  # Instalações via pip
+  - pip:
+      # Meeko para preparação de ligantes
+      - meeko>=0.5.0
+      
+      # ProDy (dependência opcional do Meeko para macromoléculas)
+      - prody>=2.0
